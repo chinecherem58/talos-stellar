@@ -8,8 +8,9 @@ import os
 import random
 import signal
 import uuid
-from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING
+from datetime import datetime, time, timedelta, timezone
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from zoneinfo import ZoneInfo
 
 import structlog
 from rich.console import Console
@@ -22,7 +23,97 @@ from talos_agent.observability import log, setup as setup_observability
 console = Console()
 logger = logging.getLogger(__name__)
 
+
+# ── Clock abstraction ─────────────────────────────────────────────────────────
+
+@runtime_checkable
+class Clock(Protocol):
+    """Minimal injectable clock: return the current UTC time.
+
+    Inject a ``FixedClock`` or ``SteppingClock`` in tests to achieve
+    deterministic coverage without any dependency on wall time.
+    Production code passes a ``SystemClock`` instance (the default).
+    """
+
+    def now_utc(self) -> datetime:
+        """Return the current time as a timezone-aware UTC datetime."""
+        ...
+
+
+class SystemClock:
+    """Production clock — delegates to ``datetime.now(timezone.utc)``."""
+
+    def now_utc(self) -> datetime:
+        return datetime.now(timezone.utc)
+
 SHUTDOWN_GRACE_PERIOD = 10  # seconds before force-exit on second signal
+
+_DEFAULT_CLOCK: Clock = SystemClock()
+
+
+def _coerce_datetime(value: datetime | None, *, default: datetime | None = None) -> datetime | None:
+    if value is None:
+        return default
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def check_should_run(
+    *,
+    now: datetime | None = None,
+    last_run: datetime | None = None,
+    interval_seconds: int | None = None,
+    schedule_time: time | None = None,
+    timezone_name: str | None = None,
+    clock: Clock | None = None,
+) -> bool:
+    """Return whether a scheduled task should run now.
+
+    The helper supports both interval-based scheduling (used by the production
+    missed-run checks) and local-time schedule boundaries for deterministic
+    timezone coverage in tests.
+    """
+    effective_clock = clock if clock is not None else _DEFAULT_CLOCK
+    effective_now = _coerce_datetime(now, default=effective_clock.now_utc())
+    assert effective_now is not None
+
+    if interval_seconds is not None:
+        if last_run is None:
+            return True
+        effective_last_run = _coerce_datetime(last_run)
+        assert effective_last_run is not None
+        elapsed = (effective_now - effective_last_run).total_seconds()
+        return elapsed >= interval_seconds
+
+    if schedule_time is None:
+        return True
+
+    tzinfo = ZoneInfo(timezone_name) if timezone_name else (effective_now.tzinfo or timezone.utc)
+    local_now = effective_now.astimezone(tzinfo)
+    effective_last_run = _coerce_datetime(last_run, default=effective_now)
+    local_last_run = effective_last_run.astimezone(tzinfo) if effective_last_run is not None else None
+    scheduled_at = local_now.replace(
+        hour=schedule_time.hour,
+        minute=schedule_time.minute,
+        second=schedule_time.second,
+        microsecond=0,
+    )
+
+    if local_last_run is None:
+        return True
+
+    if local_now < scheduled_at:
+        return False
+
+    local_last_run_at_same_boundary = local_last_run.replace(
+        hour=schedule_time.hour,
+        minute=schedule_time.minute,
+        second=schedule_time.second,
+        microsecond=0,
+    )
+    return local_last_run_at_same_boundary <= scheduled_at
+
 
 async def run_dividend_distribution(
     *,
@@ -257,6 +348,7 @@ class DurableBackoff:
         max_backoff: float = 300.0,
         jitter: float = 0.2,
         max_attempts: int = MAX_ATTEMPTS_DEFAULT,
+        clock: Clock | None = None,
     ):
         self.task_name = task_name
         self._db = db
@@ -265,6 +357,7 @@ class DurableBackoff:
         self.max_backoff = max_backoff
         self.jitter = jitter
         self.max_attempts = max_attempts
+        self._clock: Clock = clock if clock is not None else _DEFAULT_CLOCK
 
         # In-memory state — restored from DB on construction
         self.fail_count: int = 0
@@ -297,7 +390,7 @@ class DurableBackoff:
 
     def _persist(self) -> None:
         """Write current in-memory state to the DB."""
-        next_at = self._next_attempt_at or datetime.now(timezone.utc)
+        next_at = self._next_attempt_at or self._clock.now_utc()
         try:
             self._db.upsert_retry_state(
                 self.task_name,
@@ -319,7 +412,7 @@ class DurableBackoff:
         """Seconds until the next attempt is allowed (0 if overdue or no state)."""
         if self._next_attempt_at is None:
             return 0.0
-        remaining = (self._next_attempt_at - datetime.now(timezone.utc)).total_seconds()
+        remaining = (self._next_attempt_at - self._clock.now_utc()).total_seconds()
         return max(remaining, 0.0)
 
     def next_delay(self) -> float:
@@ -368,12 +461,13 @@ class DurableBackoff:
             )
 
         delay = self.next_delay()
-        self._next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        self._next_attempt_at = self._clock.now_utc() + timedelta(seconds=delay)
         self._persist()
 
-async def run(settings: Settings, agent_slot: int = 0) -> None:
+async def run(settings: Settings, agent_slot: int = 0, clock: Clock | None = None) -> None:
     """Entry point called by `talos-agent start`. agent_slot used for log prefixes in multi mode."""
     setup_observability()
+    effective_clock = clock if clock is not None else _DEFAULT_CLOCK
     from talos_agent.api_client import TalosAPIClient
     from talos_agent.db import LocalDB, get_db_path
 
@@ -616,7 +710,7 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
 
     async def polling_task():
         """Poll Web API for approvals and commerce jobs."""
-        backoff = DurableBackoff(task_name="polling", db=db, base_delay=settings.polling_interval)
+        backoff = DurableBackoff(task_name="polling", db=db, base_delay=settings.polling_interval, clock=effective_clock)
         while not shutdown_event.is_set():
             try:
                 approvals = await api.get_approvals(settings.talos_id, status="pending")
@@ -651,7 +745,7 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
 
     async def heartbeat_task():
         """Report online status periodically."""
-        backoff = DurableBackoff(task_name="heartbeat", db=db, base_delay=settings.heartbeat_interval)
+        backoff = DurableBackoff(task_name="heartbeat", db=db, base_delay=settings.heartbeat_interval, clock=effective_clock)
         while not shutdown_event.is_set():
             try:
                 await api.update_status(settings.talos_id, online=True)
@@ -669,7 +763,7 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
     async def job_heartbeat_task():
         """Extend leases on claimed jobs periodically."""
         from talos_agent.tools.commerce import get_claimed_jobs_copy
-        backoff = DurableBackoff(task_name="job_heartbeat", db=db, base_delay=settings.job_heartbeat_interval)
+        backoff = DurableBackoff(task_name="job_heartbeat", db=db, base_delay=settings.job_heartbeat_interval, clock=effective_clock)
         while not shutdown_event.is_set():
             try:
                 claimed = get_claimed_jobs_copy()
@@ -690,7 +784,7 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
 
     async def activity_flush_task():
         """Flush buffered activity logs to Web API."""
-        backoff = DurableBackoff(task_name="activity_flush", db=db, base_delay=30)
+        backoff = DurableBackoff(task_name="activity_flush", db=db, base_delay=30, clock=effective_clock)
         while not shutdown_event.is_set():
             try:
                 pending = db.get_pending_activities()
@@ -772,8 +866,13 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
             try:
                 # Prevent duplicate runs after restart
                 last_run = db.get_last_run("dividend_distribution")
-                if last_run:
-                    elapsed = (datetime.now(timezone.utc) - last_run).total_seconds()
+                if last_run and not check_should_run(
+                    now=effective_clock.now_utc(),
+                    last_run=last_run,
+                    interval_seconds=distribution_interval,
+                    clock=effective_clock,
+                ):
+                    elapsed = (effective_clock.now_utc() - last_run).total_seconds()
                     remaining = distribution_interval - elapsed
                     if remaining > 0:
                         console.print(
