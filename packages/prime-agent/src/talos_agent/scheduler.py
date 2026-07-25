@@ -517,6 +517,39 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
                             cycle_id=cycle_id,
                         )
                         context = AgentContext.from_db(db, talos_config)
+
+                        # ── Replay capture (disabled by default) ──────────────
+                        capture = None
+                        replay_store = None
+                        if settings.replay_enabled:
+                            from talos_agent.replay.capture import CaptureConfig, EventCapture
+                            from talos_agent.replay.store import ReplayStore
+                            from talos_agent import __version__ as _agent_version
+                            capture_cfg = CaptureConfig(
+                                max_events=settings.replay_max_events,
+                                max_payload_bytes=settings.replay_max_payload_bytes,
+                                enabled=True,
+                                redact_payloads=True,
+                            )
+                            capture = EventCapture(cycle_id=cycle_id, config=capture_cfg)
+                            replay_store = ReplayStore(db._conn)
+                            replay_store.start_session(
+                                cycle_id=cycle_id,
+                                talos_id=settings.talos_id,
+                                agent_version=_agent_version,
+                                meta={"talos_config": {
+                                    k: v for k, v in talos_config.items()
+                                    # Exclude large or sensitive fields from meta
+                                    if k not in ("secret", "apiKey", "privateKey")
+                                    and not isinstance(v, (bytes, bytearray))
+                                    and len(str(v)) < 512
+                                }},
+                            )
+                            capture.record_cycle_start(
+                                talos_name=talos_config.get("name", ""),
+                                agent_version=_agent_version,
+                            )
+
                         await agent_loop(
                             settings=settings,
                             tools=tools,
@@ -524,12 +557,49 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
                             context=context,
                             db=db,
                             shutdown_event=shutdown_event,
+                            capture=capture,
                         )
+
+                        # ── Flush replay events ───────────────────────────────
+                        if capture is not None and replay_store is not None:
+                            try:
+                                written = replay_store.flush_capture(capture)
+                                replay_store.end_session(
+                                    cycle_id=cycle_id,
+                                    status="complete",
+                                    dropped_events=capture.dropped,
+                                    event_count=written,
+                                )
+                                # Prune old sessions to cap disk usage
+                                replay_store.prune_sessions(
+                                    keep_last=settings.replay_keep_sessions,
+                                    talos_id=settings.talos_id,
+                                )
+                                log.info(
+                                    "replay_session_saved",
+                                    cycle_id=cycle_id,
+                                    events=written,
+                                    dropped=capture.dropped,
+                                )
+                            except Exception as replay_err:
+                                log.warning(
+                                    "replay_flush_error",
+                                    cycle_id=cycle_id,
+                                    error=str(replay_err),
+                                )
+
                         db.update_schedule("agent_cycle")
                         log.info("agent_cycle_complete", cycle_id=cycle_id)
                 except Exception as e:
                     console.print(f"[red]Agent cycle error: {e}[/red]")
                     log.error("agent_cycle_error", error=str(e), cycle_id=cycle_id)
+                    # Mark replay session as error if we were recording
+                    if settings.replay_enabled:
+                        try:
+                            from talos_agent.replay.store import ReplayStore as _RS
+                            _RS(db._conn).end_session(cycle_id, status="error")
+                        except Exception:
+                            pass
                     try:
                         import sentry_sdk
 

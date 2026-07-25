@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 
 import click
 from rich.console import Console
-import re
 
 from talos_agent import __version__
 from talos_agent.config import APP_DIR, Settings, ensure_app_dir
@@ -62,7 +62,7 @@ def start(talos_id: str | None, env_file: str):
                         sys.exit(1)
                     dec = decrypt_with_password(value, master_key)
                     os.environ.setdefault(key, dec)
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     console.print(f"[red]Error decrypting {key}:[/red] {e}")
                     sys.exit(1)
             else:
@@ -123,6 +123,7 @@ def config(api_key: str, openai_key: str):
 def encrypt_keys(env_file: str):
     """Encrypt plaintext secret-like values in an .env file using a master password."""
     from pathlib import Path
+
     from talos_agent.crypto import encrypt_with_password
 
     path = Path(env_file)
@@ -197,3 +198,168 @@ def status():
     console.print(f"[bold]Pending approvals:[/bold] {len(pending)}")
 
     db.close()
+
+
+# ── Replay commands ────────────────────────────────────────────────────────────
+
+@main.group()
+def replay():
+    """Deterministic execution replay for incident analysis."""
+
+
+@replay.command(name="list")
+@click.option("--talos-id", default=None, help="Filter by Talos ID")
+@click.option("--limit", default=20, show_default=True, help="Max sessions to show")
+@click.option("--status", default=None, help="Filter by status: complete, error, recording")
+@click.option("--env-file", default=".env", help="Path to .env file")
+def replay_list(talos_id: str | None, limit: int, status: str | None, env_file: str):
+    """List recorded replay sessions."""
+    from talos_agent.db import LocalDB
+    from talos_agent.replay.store import ReplayStore
+
+    ensure_app_dir()
+    db = LocalDB()
+    store = ReplayStore(db._conn)
+
+    sessions = store.list_sessions(talos_id=talos_id, limit=limit, status=status)
+    db.close()
+
+    if not sessions:
+        console.print("[yellow]No replay sessions found.[/yellow]")
+        return
+
+    console.print(f"[bold]Replay sessions ({len(sessions)}):[/bold]\n")
+    for s in sessions:
+        status_color = {
+            "complete": "green",
+            "error": "red",
+            "recording": "yellow",
+        }.get(s["status"], "white")
+        console.print(
+            f"  [{status_color}]{s['status']:9}[/{status_color}]  "
+            f"[bold]{s['cycle_id'][:16]}...[/bold]  "
+            f"events={s['event_count']:4d}  dropped={s['dropped_events']}  "
+            f"started={s['started_at'][:19]}  v={s.get('agent_version', '?')}"
+        )
+
+
+@replay.command(name="show")
+@click.argument("cycle_id")
+@click.option("--events", "show_events", is_flag=True, default=False, help="Show individual events")
+@click.option("--kind", default=None, help="Filter events by kind")
+def replay_show(cycle_id: str, show_events: bool, kind: str | None):
+    """Show details of a recorded replay session."""
+    from talos_agent.db import LocalDB
+    from talos_agent.replay.store import ReplayStore
+
+    ensure_app_dir()
+    db = LocalDB()
+    store = ReplayStore(db._conn)
+
+    session = store.get_session(cycle_id)
+    if not session:
+        console.print(f"[red]Session not found:[/red] {cycle_id}")
+        db.close()
+        sys.exit(1)
+
+    console.print(f"[bold]Session:[/bold] {cycle_id}")
+    console.print(f"  Talos ID:      {session['talos_id']}")
+    console.print(f"  Status:        {session['status']}")
+    console.print(f"  Agent version: {session.get('agent_version', 'unknown')}")
+    console.print(f"  Started:       {session['started_at']}")
+    console.print(f"  Ended:         {session.get('ended_at', 'N/A')}")
+    console.print(f"  Events:        {session['event_count']}")
+    console.print(f"  Dropped:       {session['dropped_events']}")
+
+    if show_events:
+        events = store.get_events(cycle_id, kind=kind)
+        console.print(f"\n[bold]Events ({len(events)}):[/bold]")
+        for ev in events:
+            console.print(
+                f"  [{ev.seq:4d}] [{ev.kind:14s}] {ev.ts[:19]}  "
+                f"{json.dumps(ev.payload, ensure_ascii=False)[:120]}"
+            )
+
+    db.close()
+
+
+@replay.command(name="run")
+@click.argument("cycle_id")
+@click.option("--env-file", default=".env", help="Path to .env file")
+@click.option("--json-output", is_flag=True, default=False, help="Output divergence report as JSON")
+def replay_run(cycle_id: str, env_file: str, json_output: bool):
+    """Re-execute an agent cycle deterministically from recorded events.
+
+    The LLM decision boundary is re-executed for real; all tool calls are
+    satisfied by recorded results (no side effects).  A divergence report is
+    printed showing whether the model made different decisions.
+    """
+    from pathlib import Path
+
+    from talos_agent.config import Settings
+    from talos_agent.db import LocalDB
+    from talos_agent.replay.runner import replay_cycle
+    from talos_agent.replay.store import ReplayStore
+
+    ensure_app_dir()
+
+    env_path = Path(env_file)
+    kwargs: dict = {}
+    if env_path.exists():
+        kwargs["_env_file"] = env_file
+    settings = Settings(**kwargs)
+
+    if not settings.llm_api_key:
+        console.print("[red]Error:[/red] LLM API key (GROQ_API_KEY or OPENAI_API_KEY) is required for replay.")
+        sys.exit(1)
+
+    db = LocalDB()
+    store = ReplayStore(db._conn)
+
+    result = asyncio.run(
+        replay_cycle(
+            cycle_id=cycle_id,
+            store=store,
+            settings=settings,
+            db=db,
+        )
+    )
+
+    db.close()
+
+    if json_output:
+        console.print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+        return
+
+    if not result.success:
+        console.print(f"[red]Replay failed:[/red] {result.error}")
+        sys.exit(1)
+
+    if result.version_warning:
+        console.print(f"[yellow]⚠ {result.version_warning}[/yellow]")
+
+    console.print(result.divergence.summary())
+
+    if not result.divergence.has_divergence:
+        console.print("[green]✓ Replay matched original cycle.[/green]")
+    else:
+        console.print("[yellow]⚠ Divergence detected — see report above.[/yellow]")
+        sys.exit(2)
+
+
+@replay.command(name="prune")
+@click.option("--keep-last", default=100, show_default=True, help="Number of sessions to retain")
+@click.option("--talos-id", default=None, help="Limit pruning to a specific Talos ID")
+def replay_prune(keep_last: int, talos_id: str | None):
+    """Delete oldest replay sessions beyond the keep-last limit."""
+    from talos_agent.db import LocalDB
+    from talos_agent.replay.store import ReplayStore
+
+    ensure_app_dir()
+    db = LocalDB()
+    store = ReplayStore(db._conn)
+
+    deleted = store.prune_sessions(keep_last=keep_last, talos_id=talos_id)
+    db.close()
+
+    console.print(f"[green]Pruned {deleted} session(s).[/green]")

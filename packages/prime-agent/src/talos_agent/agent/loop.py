@@ -16,6 +16,7 @@ from talos_agent.http import call_with_retry
 if TYPE_CHECKING:
     from talos_agent.config import Settings
     from talos_agent.db import LocalDB
+    from talos_agent.replay.capture import EventCapture
     from talos_agent.tools.registry import ToolRegistry
 
 console = Console()
@@ -46,8 +47,17 @@ async def agent_loop(
     db: LocalDB,
     system_prompt_override: str | None = None,
     shutdown_event: asyncio.Event | None = None,
+    capture: EventCapture | None = None,
 ) -> list[dict]:
-    """Run one agent cycle: LLM decides tools to call until done."""
+    """Run one agent cycle: LLM decides tools to call until done.
+
+    Parameters
+    ----------
+    capture:
+        Optional ``EventCapture`` instance.  When provided, every LLM request,
+        LLM response, tool call, and tool result is recorded for later replay.
+        Pass ``None`` (the default) to run without instrumentation.
+    """
     client = get_openai_client(settings.llm_api_key, settings.llm_base_url)
 
     system_prompt = system_prompt_override or build_system_prompt(talos_config, context)
@@ -58,12 +68,22 @@ async def agent_loop(
         {"role": "user", "content": "Decide and execute your next actions based on the current context."},
     ]
 
+    outcome = "complete"
     for iteration in range(settings.max_iterations):
         if shutdown_event and shutdown_event.is_set():
             console.print("[yellow]Shutdown requested — aborting agent loop.[/yellow]")
+            outcome = "shutdown"
             break
 
         console.print(f"[dim]Agent iteration {iteration + 1}...[/dim]")
+
+        # Record the outgoing LLM request (sanitised by capture)
+        if capture is not None:
+            capture.record_llm_request(
+                model=settings.llm_model,
+                messages=messages,
+                tools=tool_schemas or [],
+            )
 
         response = await call_with_retry(
             lambda: client.chat.completions.create(
@@ -92,6 +112,17 @@ async def agent_loop(
             ]
         messages.append(assistant_msg)
 
+        # Record the LLM response
+        if capture is not None:
+            capture.record_llm_response(
+                content=msg.content,
+                tool_calls=[
+                    {"id": tc.id, "name": tc.function.name,
+                     "arguments": tc.function.arguments}
+                    for tc in (msg.tool_calls or [])
+                ],
+            )
+
         # No tool calls → agent is done
         if not msg.tool_calls:
             console.print("[green]Agent cycle complete — no more actions.[/green]")
@@ -107,10 +138,18 @@ async def agent_loop(
 
             console.print(f"[yellow]Tool:[/yellow] {fn_name}({_truncate_args(args)})")
 
+            # Record the outgoing tool call
+            if capture is not None:
+                capture.record_tool_call(fn_name, args)
+
             result = await tools.execute(fn_name, args)
             result_str = json.dumps(result, default=str, ensure_ascii=False)
 
             console.print(f"[dim]Result:[/dim] {result_str[:200]}")
+
+            # Record the tool result
+            if capture is not None:
+                capture.record_tool_result(fn_name, result)
 
             messages.append({
                 "role": "tool",
@@ -119,6 +158,10 @@ async def agent_loop(
             })
     else:
         console.print("[yellow]Agent hit max iterations limit.[/yellow]")
+        outcome = "max_iterations"
+
+    if capture is not None:
+        capture.record_cycle_end(outcome=outcome, iterations=iteration + 1)  # type: ignore[possibly-undefined]
 
     return messages
 
