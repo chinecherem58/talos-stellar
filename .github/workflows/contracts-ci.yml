@@ -5,11 +5,15 @@ on:
     branches: [main]
     paths:
       - 'contracts/**'
+      - 'scripts/check-wasm-size.mjs'
+      - 'scripts/wasm-size-budgets.json'
       - '.github/workflows/contracts-ci.yml'
   push:
     branches: [main]
     paths:
       - 'contracts/**'
+      - 'scripts/check-wasm-size.mjs'
+      - 'scripts/wasm-size-budgets.json'
       - '.github/workflows/contracts-ci.yml'
 
 permissions:
@@ -36,3 +40,7 @@ jobs:
 
       - name: Build Soroban WASM contracts
         run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: Check WASM size budgets
+        working-directory: ${{ github.workspace }}
+        run: node scripts/check-wasm-size.mjs
