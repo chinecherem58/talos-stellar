@@ -5,12 +5,13 @@ edition = "2021"
 publish = false
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 doctest = false
 
 [dependencies]
 soroban-sdk = { workspace = true }
 ttl-manager = { path = "../ttl_manager" }
+pause-control = { path = "../pause_control" }
 
 [dev-dependencies]
 talos-registry = { path = "../talos_registry" }
