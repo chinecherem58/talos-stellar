@@ -1,14 +1,19 @@
+import { withRequestId } from "@/lib/with-request-id";
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { tlsTalos, tlsPatrons, tlsActivities, tlsRevenues } from "@/db/schema";
 import { and, desc, eq, sql } from "drizzle-orm";
+import { badRequest, internalError } from "@/lib/api-response";
+import { parseLimit, LEADERBOARD_DEFAULT_LIMIT, LEADERBOARD_MAX_LIMIT, MAX_CURSOR_LENGTH } from "@/lib/limits";
 
 // GET /api/leaderboard — Ranking data with cursor-based pagination
-export async function GET(request: NextRequest) {
+async function _GET(request: NextRequest) {
   try {
-    const { searchParams } = request.nextUrl;
+    const { searchParams } = new URL(request.url);
     const cursor = searchParams.get("cursor");
-    const limit = Math.min(Math.max(parseInt(searchParams.get("limit") ?? "50", 10) || 50, 1), 100);
+    const parsedLimit = parseLimit(searchParams.get("limit"), LEADERBOARD_DEFAULT_LIMIT, LEADERBOARD_MAX_LIMIT);
+    if (!parsedLimit.ok) return parsedLimit.response;
+    const limit = parsedLimit.limit;
 
     const patronCount = db
       .select({
@@ -41,26 +46,32 @@ export async function GET(request: NextRequest) {
 
     let parsedCursor: [number, string] | null = null;
     if (cursor) {
+      if (cursor.length > MAX_CURSOR_LENGTH) {
+        return badRequest(request, "Invalid cursor");
+      }
       try {
         const decoded = JSON.parse(Buffer.from(cursor, "base64").toString());
         if (
           Array.isArray(decoded) &&
+          decoded.length === 2 &&
           typeof decoded[0] === "number" &&
           typeof decoded[1] === "string"
         ) {
           parsedCursor = decoded as [number, string];
         } else {
-          return Response.json({ error: "Invalid cursor format" }, { status: 400 });
+          return badRequest(request, "Invalid cursor format");
         }
       } catch {
-        return Response.json({ error: "Invalid cursor" }, { status: 400 });
+        return badRequest(request, "Invalid cursor");
       }
     }
 
     if (parsedCursor) {
       const [cursorRevenue, cursorId] = parsedCursor;
       conditions.push(
-        sql`coalesce(${revenueSum.total}, 0) < ${cursorRevenue}
+        sql`coalesce(${
+revenueSum.total}, 0) < ${
+cursorRevenue}
             OR (coalesce(${revenueSum.total}, 0) = ${cursorRevenue}
                 AND ${tlsTalos.id} < ${cursorId})`,
       );
@@ -76,7 +87,8 @@ export async function GET(request: NextRequest) {
         totalSupply: tlsTalos.totalSupply,
         patronCount: patronCount.count,
         activityCount: activityCount.count,
-        totalRevenue: sql<number>`coalesce(${revenueSum.total}, 0)`,
+        totalRevenue: sql<number>`coalesce(${
+revenueSum.total}, 0)`,
       })
       .from(tlsTalos)
       .leftJoin(patronCount, eq(tlsTalos.id, patronCount.talosId))
@@ -89,7 +101,7 @@ export async function GET(request: NextRequest) {
     const hasMore = rows.length > limit;
     const page = hasMore ? rows.slice(0, limit) : rows;
 
-    const data = page.map((c) => ({
+    const data = page.map((c) =>({
       id: c.id,
       name: c.name,
       category: c.category,
@@ -112,6 +124,8 @@ export async function GET(request: NextRequest) {
 
     return Response.json({ data, nextCursor });
   } catch {
-    return Response.json({ error: "Internal server error" }, { status: 500 });
+    return internalError(request);
   }
 }
+
+export const GET = withRequestId(_GET);
