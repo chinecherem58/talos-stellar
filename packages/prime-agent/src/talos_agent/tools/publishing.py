@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from rich.console import Console
 
+from talos_agent.tools import context as _context
 from talos_agent.tools.registry import tool
 
 if TYPE_CHECKING:
@@ -18,6 +19,12 @@ console = Console()
 # Injected by registry.build_all_tools
 _adapter_registry: AdapterRegistry = None  # type: ignore[assignment]
 
+
+def _deps():
+    """This agent's dependencies: the bound ToolContext, else this module's globals."""
+    return _context.resolve(globals())
+
+
 _TIMEOUT = 90  # seconds
 
 
@@ -26,7 +33,7 @@ def _publish_safe(fn: Callable) -> Callable:
 
     @functools.wraps(fn)
     async def wrapper(*args: Any, **kwargs: Any) -> dict:
-        if _adapter_registry is None:
+        if _deps().adapter_registry is None:
             return {"error": "Adapter registry not initialized"}
         try:
             return await asyncio.wait_for(fn(*args, **kwargs), timeout=_TIMEOUT)
@@ -43,17 +50,19 @@ def _publish_safe(fn: Callable) -> Callable:
     "Publish content to a social channel. Call get_publishing_channels first to see available channels and their character limits.",
 )
 @_publish_safe
-async def publish_content(content: str, channel: str = "X") -> dict:
-    adapter = _adapter_registry.get(channel)
+async def publish_content(
+    content: str, channel: str = "X", operation_id: str | None = None
+) -> dict:
+    adapter = _deps().adapter_registry.get(channel)
     if not adapter:
         return {
             "error": f"Channel '{channel}' not available.",
-            "available_channels": _adapter_registry.available_channels(),
+            "available_channels": _deps().adapter_registry.available_channels(),
         }
     valid, error = adapter.validate_content(content)
     if not valid:
         return {"error": error}
-    result = await adapter.post(content)
+    result = await adapter.post(content, operation_id=operation_id)
     return result.to_dict()
 
 
@@ -62,8 +71,13 @@ async def publish_content(content: str, channel: str = "X") -> dict:
     "Reply to a post on a social channel. Requires channel name, target post URL, and reply content.",
 )
 @_publish_safe
-async def reply_on_channel(channel: str, target_url: str, content: str) -> dict:
-    adapter = _adapter_registry.get(channel)
+async def reply_on_channel(
+    channel: str,
+    target_url: str,
+    content: str,
+    operation_id: str | None = None,
+) -> dict:
+    adapter = _deps().adapter_registry.get(channel)
     if not adapter:
         return {"error": f"Channel '{channel}' not available"}
     caps = adapter.get_capabilities()
@@ -72,7 +86,7 @@ async def reply_on_channel(channel: str, target_url: str, content: str) -> dict:
     valid, error = adapter.validate_content(content)
     if not valid:
         return {"error": error}
-    result = await adapter.reply(target_url, content)
+    result = await adapter.reply(target_url, content, operation_id=operation_id)
     return result.to_dict()
 
 
@@ -82,7 +96,7 @@ async def reply_on_channel(channel: str, target_url: str, content: str) -> dict:
 )
 @_publish_safe
 async def get_channel_mentions(channel: str = "X") -> dict:
-    adapter = _adapter_registry.get(channel)
+    adapter = _deps().adapter_registry.get(channel)
     if not adapter:
         return {"error": f"Channel '{channel}' not available"}
     mentions = await adapter.get_mentions()
@@ -95,7 +109,7 @@ async def get_channel_mentions(channel: str = "X") -> dict:
 )
 @_publish_safe
 async def search_channel(query: str, channel: str = "X") -> dict:
-    adapter = _adapter_registry.get(channel)
+    adapter = _deps().adapter_registry.get(channel)
     if not adapter:
         return {"error": f"Channel '{channel}' not available"}
     caps = adapter.get_capabilities()
@@ -110,9 +124,9 @@ async def search_channel(query: str, channel: str = "X") -> dict:
     "Get all available social publishing channels and their capabilities (character limits, supported features). Call this before composing content.",
 )
 async def get_publishing_channels() -> dict:
-    if _adapter_registry is None:
+    if _deps().adapter_registry is None:
         return {"error": "Adapter registry not initialized"}
     return {
-        "available": _adapter_registry.available_channels(),
-        "channels": _adapter_registry.capabilities(),
+        "available": _deps().adapter_registry.available_channels(),
+        "channels": _deps().adapter_registry.capabilities(),
     }

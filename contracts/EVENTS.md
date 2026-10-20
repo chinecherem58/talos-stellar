@@ -1,242 +1,185 @@
-# Soroban Contract Events
+# Talos Contract Event Indexing Specification
 
-This document lists every event emitted by the Talos Protocol Soroban contracts.
-All events follow the Soroban SDK convention: `env.events().publish(topics, data)`.
+**Spec version:** 1.3.0
+**Applies to:** talos_registry, talos_governance, talos_name_service, talos_dividends
 
-Topics are a tuple; the first element is always a `Symbol` identifying the event type.
-Data is a tuple containing the payload fields.
+## 1. Event envelope
 
----
+Every Soroban event an indexer receives has:
 
-## TalosNameService
+| Field | Type | Notes |
+|---|---|---|
+| contract | Address | emitting contract |
+| topics | Vec<Val> | topic[0] is always a Symbol identifying the event type |
+| data | Val (tuple) | positional, see per-event tables below |
+| ledger_sequence | u32 | from the RPC/Horizon envelope, not the event itself |
+| tx_hash | Hash | from the envelope |
+| tx_index_in_ledger | u32 | zero-based transaction position from the envelope |
+| event_index_in_tx | u32 | zero-based event position from the envelope |
 
-Contract address (testnet): `CAP32WBDUMF4UOXLSCHQDM3MDKS4WNQUQAB4WMAGUXTXJNQ4OWD3CQXF`
+## 1.1. Topic positions and data decoding rules
 
-### `name_reg` — Name registered
+- **`topics[0]` is always the event-type `Symbol`.** Indexers dispatch on it.
+- **Filterable entities live in `topics[1..]`** in a fixed per-event order so
+  topic-indexed subscriptions can narrow results without fetching every event.
+  For example `tls_crt` puts the `creator: Address` at `topics[1]` and
+  `div_clm` puts `(epoch_id, patron)` at `topics[1..2]`.
+- **`data` is a positional tuple** decoded strictly left-to-right using the
+  per-event `data` column below. Field order is part of the stable contract:
+  it is never reordered except under a breaking (major) version bump per §4.
+- **Decoded JSON shape.** The canonical fixtures (`contracts/fixtures/`) retain the raw envelope cursor fields `ledger_sequence`, `tx_index_in_ledger`, and `event_index_in_tx`. The helper returns decoded fields with the parsed cursor so consumers can sort and paginate by the full tuple. Addresses stay as `G…`/`C…` strings, symbols stay as strings,
+  and `u32`/`u64`/`i128` are numbers. The `event-query` helper decodes a raw
+  event and rejects anything that does not match.
+- **Malformed payloads** (empty topics, `topics[0]` not a symbol, wrong topic
+  type, wrong data arity, wrong data type) are rejected by the helper rather
+  than silently mis-decoded.
 
-Emitted when a Talos successfully registers (or renames to) a human-readable name.
+## 2. Ordering guarantees
 
-| | |
+Indexers MUST treat `(ledger_sequence, tx_index_in_ledger, event_index_in_tx)`
+as the canonical cursor. `tx_index_in_ledger` and `event_index_in_tx` are
+zero-based positions supplied by the Soroban event envelope. They represent
+ledger transaction order and event publication order within a transaction,
+including events from nested contract invocations. An operation that publishes
+multiple compatibility events keeps that order stable: `tls_crt` precedes
+`tls_crt2`, and `name_reg` precedes `name_reg2`.
+
+Consumers MUST sort and paginate by the full cursor, not response arrival order,
+topic, contract, or fixture-file order. Events are strictly monotonic on this tuple and
+never reordered within a ledger. On restart, an indexer resumes from the
+last committed cursor and replays forward — this is safe because processing
+is idempotent per cursor (see §4).
+
+## 3. Event catalog
+
+### talos_registry
+
+| topics | data | meaning |
+|---|---|---|
+| (`tls_crt`, creator: Address) | (talos_id: u32, name: String, category: String) | new Talos registered |
+| (`tls_crt2`, creator: Address) | (version: u32, talos_id: u32, name: String, category: String) | new Talos registered (v2) |
+| (`pat_upd`, talos_id: u32) | (creator_addr: Address, creator_share: u32, investor_share: u32) | patron split changed |
+| (`meta_upd`, talos_id: u32) | (name: String, category: String, description: String) | creator metadata fields updated (added v1.5.0) |
+| (`fee_chg`,) | (old_bps: u32, new_bps: u32) | protocol fee changed |
+| (`adm_prp`,) | (current: Address, proposed: Address) | admin transfer proposed |
+| (`adm_acc`,) | (new_admin: Address,) | admin transfer accepted |
+| (`adm_cnl`,) | (cancelled: Address,) | admin transfer cancelled |
+| (`tl_sch`, proposal_id: u64) | (action: AdminAction, eta: u64, proposer: Address) | timelock scheduled |
+| (`tl_exec`, proposal_id: u64) | (action: AdminAction, executor: Address) | timelock executed |
+| (`tl_cnl`, proposal_id: u64) | (action: AdminAction, canceller: Address) | timelock cancelled |
+| (`tl_cfg`,) | (old_min_delay: u64, new_min_delay: u64, grace_period: u64) | timelock config changed |
+
+### talos_governance
+| topics | data |
 |---|---|
-| **Symbol** | `name_reg` |
+| (`prop_crt`, proposal_id: u32) | (talos_id: u32, proposer: Address) |
+| (`vote`, proposal_id: u32) | (voter: Address, choice: VoteChoice, weight: i128) |
+| (`prop_stat`, proposal_id: u32) | status: ProposalStatus |
+| (`qrm_rchd`, proposal_id: u32) | (proposal_id: u32, votes_cast: i128, quorum_threshold: i128, approval_bps: i128) |
 
-**Topics**
+`qrm_rchd` is emitted **at most once** per proposal, on the first vote that brings `votes_cast` to or above `quorum_threshold`. A `DataKey::QuorumReached(proposal_id)` sentinel prevents re-emission for subsequent votes.
 
-| Index | Type | Description |
-|-------|------|-------------|
-| 0 | `Symbol` | `"name_reg"` |
-| 1 | `u32` | `talos_id` — the on-chain Talos ID that received the name |
-
-**Data** `(String, Address)`
-
-| Index | Type | Description |
-|-------|------|-------------|
-| 0 | `String` | `name` — the registered name (e.g. `"marketbot"`) |
-| 1 | `Address` | `owner` — the address that authorised the registration |
-
-**Example (XDR-decoded)**
-```
-topics: ["name_reg", 42]
-data:   ["marketbot", "GCREATOR..."]
-```
-
----
-
-### `name_rel` — Name released
-
-Emitted when a Talos creator releases a registered name, freeing it for re-registration.
-Both the forward mapping (`name → talos_id`) and the reverse mapping (`talos_id → name`)
-are removed from persistent storage before this event is published.
-
-| | |
+### talos_name_service
+| topics | data |
 |---|---|
-| **Symbol** | `name_rel` |
+| (`name_reg`, talos_id: u32) | (name: String, owner: Address) |
+| (`name_reg2`, talos_id: u32) | (version: u32, name: String, owner: Address) |
+| (`reg_upd`,) | (old_registry: Address, new_registry: Address) |
+| (`tl_sch`/`tl_exec`/`tl_cnl`/`tl_cfg`) | same shape as registry timelock events |
+| (`pause_on`, domain: PauseDomain) | (actor: Address, expires_at: u64) |
+| (`pause_off`, domain: PauseDomain) | (actor: Address,) |
+| (`guard_add`,) | (guardian: Address,) |
+| (`guard_rem`,) | (guardian: Address,) |
+| (`name_fee`, talos_id: u32) | (payer: Address, asset: Address, fee: i128) |
+| (`dep_path`,) | (deprecated: String, replacement: String) |
 
-**Topics**
+**`pause_on` semantics:**
+- `domain` identifies the paused write path (`NameRegistration`).
+- `expires_at` is the Unix timestamp when the pause automatically lifts.
+  A value of `0` means the pause is indefinite (only settable by the admin).
+  Privacy-safe: no caller transaction hash or secret data is included.
 
-| Index | Type | Description |
-|-------|------|-------------|
-| 0 | `Symbol` | `"name_rel"` |
-| 1 | `u32` | `talos_id` — the Talos whose name was released |
+**Pause expiry rules (enforced on-chain, #597):**
+- Admin can set `expires_at = 0` (indefinite) or `> 0` up to `MAX_ADMIN_PAUSE_SECS` (30 days).
+- Guardian can only pause for `1 .. MAX_GUARDIAN_PAUSE_SECS` (7 days) — duration = 0 is rejected.
+- A guardian cannot overwrite an admin-set pause (`DomainLockedByAdmin` error).
+- Pauses are lazily expired: `is_paused` / `pause_info` treat an expired record as inactive
+  without removing it from storage; explicit `unpause` removes the record and emits `pause_off`.
+- `pause_off` is only emitted on an explicit admin `unpause` call, not on lazy expiry.
 
-**Data** `(String, Address)`
-
-| Index | Type | Description |
-|-------|------|-------------|
-| 0 | `String` | `name` — the name that was released |
-| 1 | `Address` | `owner` — the address that authorised the release (must be the registry creator) |
-
-**Example (XDR-decoded)**
-```
-topics: ["name_rel", 42]
-data:   ["marketbot", "GCREATOR..."]
-```
-
-**Entry-point**: `release_name(owner: Address, talos_id: u32)`  
-**Authorization**: `owner.require_auth()` + cross-contract `creator_of(talos_id)` check against TalosRegistry.  
-**Panics if**: `talos_id` has no registered name, or `owner` is not the registry creator.
-
----
-
-### `reg_upd` — Registry contract updated
-
-Emitted when the TalosRegistry contract pointer is changed (directly or via timelock).
-
-| | |
+### talos_dividends
+| topics | data |
 |---|---|
-| **Symbol** | `reg_upd` |
+| (`ep_cmt`, talos_id: u32) | (epoch_id: u64, total: i128, expiry_secs: u64) |
+| (`div_clm`, epoch_id: u64, patron: Address) | (talos_id: u32, amount: i128, role: PatronRole) |
+| (`div_dst`, epoch_id: u64) | (talos_id: u32, dust: i128) |
+| (`ep_rcv`, epoch_id: u64) | (talos_id: u32, recovered: i128, admin: Address) |
 
-**Topics**
+`VoteChoice` is `{ Approve | Reject }`; `ProposalStatus` is
+`{ Active | Approved | Rejected | Executed }`; `PatronRole` is
+`{ Creator | Investor | Treasury }`. These enums are `#[contracttype]` and
+additive-only (new variants are appended at the end).
 
-| Index | Type | Description |
-|-------|------|-------------|
-| 0 | `Symbol` | `"reg_upd"` |
+## 4. Compatibility & versioning rules
 
-**Data** `(Address, Address)`
+- **Additive** (new event, new trailing data field): minor version bump, backward compatible — old indexers keep working, ignore the new field.
+- **Breaking** (removed/reordered/type-changed field, repurposed topic symbol): a **new topic symbol** must be introduced (e.g. `tls_crt` → `tls_crt2`); the old symbol is retired but its meaning is never reused. Major version bump.
+- Every event is emitted from exactly one code path per contract; enums used in data (e.g. `AdminAction`, `ProposalStatus`) are `#[contracttype]` and additive-only (new variants appended at the end).
+- **Fixture format versioning note:** the canonical fixture file
+  `contracts/fixtures/event_fixtures.json` carries a top-level `spec_version`
+  field. Any change that alters how events decode (a new topic position, a
+  reordered/retargeted data field, a new event family, or a changed type)
+  **MUST** bump `spec_version` in the same commit as the fixture change and
+  keep the `event_catalog` in lock-step with the Rust event definitions.
+  Additive fixture additions (a new example event that reuses an existing
+  catalog entry, new empty-range rows) only need a minor bump. Consumers
+  should assert the `spec_version` they expect before decoding.
 
-| Index | Type | Description |
-|-------|------|-------------|
-| 0 | `Address` | `old_registry` |
-| 1 | `Address` | `new_registry` |
+## 5. Conformance fixtures
 
----
+See `contracts/fixtures/event_fixtures.json` — a versioned fixture document
+with:
 
-### `tl_sch` — Timelock action scheduled
+- `event_catalog` — the canonical topic-position + data-shape catalog per
+  event family (`creation`, `update`, `governance`, `payment`).
+- `fixtures` — one worked example per event type. Each entry carries the raw
+  `topics`/`data` plus a fully-decoded `decoded` payload; any indexer
+  implementation should decode the raw form and match `decoded` exactly.
+- `empty_ranges` — representative ledger ranges that must return zero events.
+- `malformed` — payloads that must be rejected (empty topics, non-symbol
+  `topics[0]`, topic-type mismatch, wrong data arity/type).
 
-| | |
-|---|---|
-| **Symbol** | `tl_sch` |
+### Bounded query helper
 
-**Topics**: `("tl_sch", proposal_id: u64)`  
-**Data**: `(action: AdminAction, eta: u64, proposer: Address)`
+`contracts/fixtures/event-query.ts` is the reference TypeScript helper:
 
----
+- `parseFixtureSet` / `parseEventFixture` — validate the document and decode
+  each event against the catalog (throws on malformed payloads / unknown
+  events).
+- `queryEvents(set, { contract?, topic?, fromLedger, toLedger, pageSize, page? })` —
+  queries by topic and **inclusive** ledger range with 1-based pagination.
+- **Bounds are enforced, never silently clamped:** both `fromLedger` and
+  `toLedger` are required (an unbounded range throws `UnboundedRangeError`);
+  `pageSize` is required and must fall within
+  `[bounds.min_page_size, bounds.max_page_size]` (an unbounded page size
+  throws `UnboundedPageSizeError`); the span
+  `toLedger - fromLedger + 1` cannot exceed `bounds.max_ledger_span`.
 
-### `tl_exec` — Timelock action executed
-
-| | |
-|---|---|
-| **Symbol** | `tl_exec` |
-
-**Topics**: `("tl_exec", proposal_id: u64)`  
-**Data**: `(action: AdminAction, executor: Address)`
-
----
-
-### `tl_cnl` — Timelock action cancelled
-
-| | |
-|---|---|
-| **Symbol** | `tl_cnl` |
-
-**Topics**: `("tl_cnl", proposal_id: u64)`  
-**Data**: `(action: AdminAction, canceller: Address)`
-
----
-
-### `tl_cfg` — Timelock configuration changed
-
-| | |
-|---|---|
-| **Symbol** | `tl_cfg` |
-
-**Topics**: `("tl_cfg",)`  
-**Data**: `(old_min_delay: u64, new_min_delay: u64, grace_period: u64)`
-
----
-
-## TalosRegistry
-
-Contract address (testnet): `CAMLL62EVCRV5CEHBO34MHUAHI5FJE5XFVAU57VZEAVY2EE5Q36FVHUX`
-
-### `tls_crt` — Talos created
-
-Emitted when a new Talos is registered on-chain.
-
-**Topics**: `("tls_crt", talos_id: u32)`  
-**Data**: `(name: String, category: String, creator: Address)`
-
----
-
-### `pat_upd` — Patron configuration updated
-
-**Topics**: `("pat_upd", talos_id: u32)`  
-**Data**: `(creator_share: u32, investor_share: u32, treasury_share: u32)`
-
----
-
-### `fee_chg` — Protocol fee changed
-
-**Topics**: `("fee_chg",)`  
-**Data**: `(old_fee_bps: u32, new_fee_bps: u32)`
-
----
-
-### `adm_prp` — Admin transfer proposed
-
-**Topics**: `("adm_prp",)`  
-**Data**: `(current_admin: Address, proposed_admin: Address)`
-
----
-
-### `adm_acc` — Admin transfer accepted
-
-**Topics**: `("adm_acc",)`  
-**Data**: `(new_admin: Address)`
-
----
-
-### `adm_cnl` — Admin transfer cancelled
-
-**Topics**: `("adm_cnl",)`  
-**Data**: `(cancelled_by: Address)`
-
----
-
-### Timelock events (`tl_sch`, `tl_exec`, `tl_cnl`, `tl_cfg`)
-
-Same schema as TalosNameService timelock events above.
-
----
-
-## TalosGovernance
-
-### `proposal_created`
-
-**Topics**: `("proposal_created", proposal_id: u64)`  
-**Data**: `(talos_id: u32, proposer: Address, title: String)`
-
----
-
-### `vote_cast`
-
-**Topics**: `("vote_cast", proposal_id: u64)`  
-**Data**: `(voter: Address, weight: u64, in_favour: bool)`
-
----
-
-### `proposal_status_changed`
-
-**Topics**: `("proposal_status_changed", proposal_id: u64)`  
-**Data**: `(old_status: Symbol, new_status: Symbol)`
-
----
-
-## Subscribing to events
-
-Use the Stellar Horizon events endpoint or the Soroban RPC `getEvents` method:
+Run the fixture and helper tests with:
 
 ```bash
-stellar events \
-  --network testnet \
-  --contract-id CAP32WBDUMF4UOXLSCHQDM3MDKS4WNQUQAB4WMAGUXTXJNQ4OWD3CQXF \
-  --type contract \
-  --start-ledger <ledger>
+pnpm --dir contracts test:fixtures   # vitest run fixtures
 ```
 
-Filter by topic symbol to isolate a specific event type:
+Existing `cargo test -p talos_registry event_fixtures`-style Rust assertions
+remain authoritative for on-chain shape; the JSON fixtures let a non-Rust
+indexer validate the same guarantee without the Soroban toolchain.
 
-```bash
-# Only name release events
-stellar events ... --filter-topics name_rel
-```
+## 6. Operational notes
+
+- Rollback: this is a documentation + read-only fixture change. Reverting
+  the commit fully restores prior state; no migration or on-chain change
+  is involved.
+- Verification: `pnpm --dir contracts test:fixtures` runs fixture parsing,
+  per-family end-to-end decode, empty-range, malformed-payload, and
+  bounded-query tests against the checked-in fixture file.
