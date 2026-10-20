@@ -77,6 +77,7 @@ pub enum ContractError {
 //
 // Event schema (topics → data):
 //   name_reg : (symbol, talos_id: u32) → (name: String, owner: Address)
+//   name_rel : (symbol, talos_id: u32) → (name: String, owner: Address)
 //   reg_upd  : (symbol,)               → (old_registry: Address, new_registry: Address)
 //   tl_sch   : (symbol, proposal_id: u64) → (action: AdminAction, eta: u64, proposer: Address)
 //   tl_exec  : (symbol, proposal_id: u64) → (action: AdminAction, executor: Address)
@@ -85,6 +86,11 @@ pub enum ContractError {
 
 fn emit_name_registered(env: &Env, talos_id: u32, name: String, owner: Address) {
     let topics = (symbol_short!("name_reg"), talos_id);
+    env.events().publish(topics, (name, owner));
+}
+
+fn emit_name_released(env: &Env, talos_id: u32, name: String, owner: Address) {
+    let topics = (symbol_short!("name_rel"), talos_id);
     env.events().publish(topics, (name, owner));
 }
 
@@ -185,7 +191,7 @@ fn validate_name(name: &String) -> bool {
 /// This constant is embedded in the WASM binary at compile time and is
 /// therefore immutable once deployed; it cannot be altered by any admin
 /// call, storage write, or cross-contract invocation.
-pub const CONTRACT_VERSION: (u32, u32, u32) = (1, 2, 0);
+pub const CONTRACT_VERSION: (u32, u32, u32) = (1, 3, 0);
 
 #[contract]
 pub struct TalosNameService;
@@ -204,7 +210,7 @@ impl TalosNameService {
     /// backwards compatible; `patch` carries bug-fixes only.
     ///
     /// # Returns
-    /// `(major: u32, minor: u32, patch: u32)` — currently `(1, 0, 0)`.
+    /// `(major: u32, minor: u32, patch: u32)` — currently `(1, 3, 0)`.
     pub fn version(_e: Env) -> (u32, u32, u32) {
         CONTRACT_VERSION
     }
@@ -268,6 +274,67 @@ impl TalosNameService {
             .set(&DataKey::TalosName(talos_id), &name);
 
         emit_name_registered(&e, talos_id, name, owner);
+    }
+
+    /// Release a name for a Talos, making it available for registration again.
+    ///
+    /// Removes both the forward mapping (`name → talos_id`) and the reverse
+    /// mapping (`talos_id → name`) from persistent storage and emits a
+    /// `name_rel` event.
+    ///
+    /// # Authorization
+    /// Only the registry creator of `talos_id` may release its name.  The same
+    /// `owner.require_auth()` + `creator_of` cross-contract check used by
+    /// `register_name` is applied here.
+    ///
+    /// # Arguments
+    /// * `e` - Soroban environment
+    /// * `owner` - The address authorizing this release (must be the registry creator)
+    /// * `talos_id` - The Talos whose name should be released
+    ///
+    /// # Panics
+    /// * If `talos_id` has no registered name.
+    /// * If `owner` is not the registry creator of `talos_id`.
+    pub fn release_name(e: Env, owner: Address, talos_id: u32) {
+        owner.require_auth();
+
+        let registry_contract: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::RegistryContract)
+            .expect("Registry contract not initialized");
+
+        let creator: Option<Address> = e.invoke_contract(
+            &registry_contract,
+            &Symbol::new(&e, "creator_of"),
+            soroban_sdk::vec![&e, talos_id.into_val(&e)],
+        );
+
+        if creator != Some(owner.clone()) {
+            panic_with_error!(&e, ContractError::UnauthorizedCaller);
+        }
+
+        // Retrieve existing name — panics if none registered
+        let name: String = e
+            .storage()
+            .persistent()
+            .get(&DataKey::TalosName(talos_id))
+            .expect("No name registered for this Talos ID");
+
+        // Remove both mappings
+        e.storage()
+            .persistent()
+            .remove(&DataKey::NameRecord(name.clone()));
+        e.storage()
+            .persistent()
+            .remove(&DataKey::TalosName(talos_id));
+
+        // Also clear the last-touched TTL tracker for this talos_id
+        e.storage()
+            .persistent()
+            .remove(&DataKey::LastTouched(talos_id));
+
+        emit_name_released(&e, talos_id, name, owner);
     }
 
     pub fn initialize(e: Env, registry_id: Address) {
@@ -942,7 +1009,7 @@ mod tests {
     #[test]
     fn version_returns_compile_time_constant() {
         let (_env, _registry_contract, _contract_id, _registry_client, client) = setup();
-        assert_eq!(client.version(), (1u32, 2u32, 0u32));
+        assert_eq!(client.version(), (1u32, 3u32, 0u32));
     }
 
     #[test]
@@ -1444,5 +1511,260 @@ mod tests {
         let prop = client.get_timelock_proposal(&proposal_id).unwrap();
         assert_eq!(prop.status, ProposalStatus::Cancelled);
         assert!(client.try_execute_action(&proposal_id).is_err());
+    }
+
+    // ── release_name() tests ──────────────────────────────────────────
+
+    fn release_name_with_auth(
+        env: &Env,
+        client: &TalosNameServiceClient,
+        contract_id: &Address,
+        registry_contract: &Address,
+        owner: &Address,
+        talos_id: u32,
+    ) {
+        client
+            .mock_auths(&[MockAuth {
+                address: owner,
+                invoke: &MockAuthInvoke {
+                    contract: contract_id,
+                    fn_name: "release_name",
+                    args: (owner.clone(), talos_id).into_val(env),
+                    sub_invokes: &[MockAuthInvoke {
+                        contract: registry_contract,
+                        fn_name: "creator_of",
+                        args: (talos_id,).into_val(env),
+                        sub_invokes: &[],
+                    }],
+                },
+            }])
+            .release_name(owner, &talos_id);
+    }
+
+    #[test]
+    fn release_name_frees_name_and_clears_reverse_record() {
+        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let owner = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+        let name = s(&env, "vega");
+
+        let talos_id = create_talos_with_auth(
+            &env,
+            &registry_client,
+            &registry_contract,
+            &owner,
+            &protocol_wallet,
+        );
+
+        register_name_with_auth(
+            &env,
+            &client,
+            &contract_id,
+            &registry_contract,
+            &owner,
+            talos_id,
+            &name,
+        );
+
+        // Confirm name is registered
+        assert_eq!(client.resolve_name(&name), Some(talos_id));
+        assert_eq!(client.name_of(&talos_id), Some(name.clone()));
+
+        // Release the name
+        release_name_with_auth(&env, &client, &contract_id, &registry_contract, &owner, talos_id);
+
+        // Name is now available again
+        assert!(client.is_name_available(&name));
+        // Forward and reverse records are both gone
+        assert_eq!(client.resolve_name(&name), None);
+        assert_eq!(client.name_of(&talos_id), None);
+        assert!(!client.has_name(&talos_id));
+    }
+
+    #[test]
+    fn release_name_emits_name_rel_event() {
+        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let owner = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+        let name = s(&env, "atlas");
+
+        let talos_id = create_talos_with_auth(
+            &env,
+            &registry_client,
+            &registry_contract,
+            &owner,
+            &protocol_wallet,
+        );
+
+        register_name_with_auth(
+            &env,
+            &client,
+            &contract_id,
+            &registry_contract,
+            &owner,
+            talos_id,
+            &name,
+        );
+
+        release_name_with_auth(&env, &client, &contract_id, &registry_contract, &owner, talos_id);
+
+        let all_events = env.events().all();
+        // Filter to name service contract events only; find last event (the release)
+        let ns_events: std::vec::Vec<_> = all_events
+            .iter()
+            .filter(|e| e.0 == contract_id)
+            .collect();
+        // Expect: name_reg + name_rel = 2 events
+        assert_eq!(ns_events.len(), 2);
+
+        let (_addr, topics, data) = ns_events.last().unwrap();
+        let t0: Symbol = TryFromVal::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+        let t1: u32 = TryFromVal::try_from_val(&env, &topics.get(1).unwrap()).unwrap();
+        assert_eq!(t0, symbol_short!("name_rel"));
+        assert_eq!(t1, talos_id);
+        let (got_name, got_owner): (String, Address) =
+            TryFromVal::try_from_val(&env, data).unwrap();
+        assert_eq!(got_name, name);
+        assert_eq!(got_owner, owner);
+    }
+
+    #[test]
+    fn release_name_unauthorized_caller_rejected() {
+        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let creator = Address::generate(&env);
+        let unauthorized = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+        let name = s(&env, "forge");
+
+        let talos_id = create_talos_with_auth(
+            &env,
+            &registry_client,
+            &registry_contract,
+            &creator,
+            &protocol_wallet,
+        );
+
+        register_name_with_auth(
+            &env,
+            &client,
+            &contract_id,
+            &registry_contract,
+            &creator,
+            talos_id,
+            &name,
+        );
+
+        // Attempt release by unauthorized address
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &unauthorized,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "release_name",
+                    args: (unauthorized.clone(), talos_id).into_val(&env),
+                    sub_invokes: &[MockAuthInvoke {
+                        contract: &registry_contract,
+                        fn_name: "creator_of",
+                        args: (talos_id,).into_val(&env),
+                        sub_invokes: &[],
+                    }],
+                },
+            }])
+            .try_release_name(&unauthorized, &talos_id);
+
+        assert!(result.is_err());
+
+        // Name must still be registered
+        assert_eq!(client.resolve_name(&name), Some(talos_id));
+    }
+
+    #[test]
+    fn release_name_fails_for_unregistered_talos_id() {
+        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let owner = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+
+        let talos_id = create_talos_with_auth(
+            &env,
+            &registry_client,
+            &registry_contract,
+            &owner,
+            &protocol_wallet,
+        );
+
+        // talos_id has no name registered
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &owner,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "release_name",
+                    args: (owner.clone(), talos_id).into_val(&env),
+                    sub_invokes: &[MockAuthInvoke {
+                        contract: &registry_contract,
+                        fn_name: "creator_of",
+                        args: (talos_id,).into_val(&env),
+                        sub_invokes: &[],
+                    }],
+                },
+            }])
+            .try_release_name(&owner, &talos_id);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn re_registration_after_release_succeeds() {
+        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+        let new_protocol_wallet = Address::generate(&env);
+        let name = s(&env, "nova");
+
+        // First Talos registers and then releases the name
+        let talos_id = create_talos_with_auth(
+            &env,
+            &registry_client,
+            &registry_contract,
+            &owner,
+            &protocol_wallet,
+        );
+
+        register_name_with_auth(
+            &env,
+            &client,
+            &contract_id,
+            &registry_contract,
+            &owner,
+            talos_id,
+            &name,
+        );
+
+        release_name_with_auth(&env, &client, &contract_id, &registry_contract, &owner, talos_id);
+
+        // A new Talos can now claim the released name
+        let new_talos_id = create_talos_with_auth(
+            &env,
+            &registry_client,
+            &registry_contract,
+            &new_owner,
+            &new_protocol_wallet,
+        );
+
+        register_name_with_auth(
+            &env,
+            &client,
+            &contract_id,
+            &registry_contract,
+            &new_owner,
+            new_talos_id,
+            &name,
+        );
+
+        assert_eq!(client.resolve_name(&name), Some(new_talos_id));
+        assert_eq!(client.name_of(&new_talos_id), Some(name));
+        // Original talos_id has no name
+        assert_eq!(client.name_of(&talos_id), None);
     }
 }
