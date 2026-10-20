@@ -1,197 +1,140 @@
+import { withRequestId } from "@/lib/with-request-id";
+import { NextRequest } from "next/server";
+import { and, desc, eq, gte, sql } from "drizzle-orm";
 import { db } from "@/db";
-import { tlsTalos, tlsCommerceJobs, tlsRevenues, tlsApprovals } from "@/db/schema";
-import { and, eq, gte, sql } from "drizzle-orm";
+import { tlsCommerceJobs, tlsCommerceServices, tlsTalos } from "@/db/schema";
+import { verifyAgentApiKey } from "@/lib/auth";
+import { parseAnalyticsLimit } from "@/lib/analytics-limits";
 
-// GET /api/talos/:id/exposure — Counterparty and financial exposure summary
-export async function GET(
-  _request: Request,
-  { params }: { params: Promise<{ id: string }> }
+function parseWindow(windowParam: string | null): { windowMs: number; windowDays: number } {
+  const raw = windowParam ?? "30d";
+  const match = raw.match(/^(\d+)d$/i);
+  if (!match) return { windowMs: 30 * 24 * 60 * 60 * 1000, windowDays: 30 };
+
+  const windowDays = Number(match[1]);
+  return { windowMs: windowDays * 24 * 60 * 60 * 1000, windowDays };
+}
+
+function toNumber(value: unknown): number {
+  const parsed = typeof value === "string" ? Number(value) : Number(value ?? 0);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function normalizeDate(value: unknown): string | null {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value as string);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+async function _GET(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> },
 ) {
   const { id } = await params;
 
   try {
+    const auth = await verifyAgentApiKey(request, id, ["revenue:read"]);
+    if (!auth.ok) return auth.response;
+
+    const { searchParams } = new URL(request.url);
+    const parsedLimit = parseAnalyticsLimit(searchParams.get("limit"), 25, 100);
+    if (!parsedLimit.ok) return parsedLimit.response;
+    const limit = parsedLimit.limit;
+    const cursor = searchParams.get("cursor");
+
     const talos = await db
-      .select({
-        id: tlsTalos.id,
-        name: tlsTalos.name,
-      })
+      .select({ id: tlsTalos.id })
       .from(tlsTalos)
       .where(eq(tlsTalos.id, id))
       .limit(1)
-      .then((r) => r[0] ?? null);
+      .then((rows) => rows[0] ?? null);
 
     if (!talos) {
       return Response.json({ error: "TALOS not found" }, { status: 404 });
     }
 
-    const now = new Date();
-    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-    const ninetyDaysAgo = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+    const { windowMs, windowDays } = parseWindow(searchParams.get("window"));
+    const since = new Date(Date.now() - windowMs);
 
-    // ── Counterparty exposure via commerce jobs ──────────────────────
-    // Aggregate spend and job counts per counterparty (requester) in 30-day window
-    const counterpartyRows = await db
+    const rows = await db
       .select({
         counterpartyId: tlsCommerceJobs.requesterTalosId,
-        jobCount: sql<number>`count(*)::int`,
-        totalAmount: sql<string>`coalesce(sum(${tlsCommerceJobs.amount}), '0')`,
-        pendingCount: sql<number>`sum(case when ${tlsCommerceJobs.status} = 'pending' then 1 else 0 end)::int`,
-        failedCount: sql<number>`sum(case when ${tlsCommerceJobs.status} = 'failed' then 1 else 0 end)::int`,
+        asset: sql<string>`coalesce(${tlsCommerceServices.currency}, 'USDC')`,
+        category: tlsCommerceJobs.serviceName,
+        reservedAmount: sql<string>`coalesce(sum(case when ${tlsCommerceJobs.status} in ('pending', 'processing') then ${tlsCommerceJobs.amount}::numeric else 0 end), '0')`,
+        settledAmount: sql<string>`coalesce(sum(case when ${tlsCommerceJobs.status} = 'completed' and ${tlsCommerceJobs.txHash} is not null then ${tlsCommerceJobs.amount}::numeric else 0 end), '0')`,
+        reservedCount: sql<number>`count(*) filter (where ${tlsCommerceJobs.status} in ('pending', 'processing'))::int`,
+        settledCount: sql<number>`count(*) filter (where ${tlsCommerceJobs.status} = 'completed' and ${tlsCommerceJobs.txHash} is not null)::int`,
+        lastObservedAt: sql<Date>`max(${tlsCommerceJobs.createdAt})`,
       })
       .from(tlsCommerceJobs)
-      .where(
+      .leftJoin(
+        tlsCommerceServices,
         and(
-          eq(tlsCommerceJobs.talosId, id),
-          gte(tlsCommerceJobs.createdAt, thirtyDaysAgo)
-        )
+          eq(tlsCommerceJobs.talosId, tlsCommerceServices.talosId),
+          eq(tlsCommerceJobs.serviceName, tlsCommerceServices.serviceName),
+        ),
       )
-      .groupBy(tlsCommerceJobs.requesterTalosId);
+      .where(and(eq(tlsCommerceJobs.talosId, id), gte(tlsCommerceJobs.createdAt, since)))
+      .groupBy(tlsCommerceJobs.requesterTalosId, tlsCommerceJobs.serviceName, tlsCommerceServices.currency)
+      .orderBy(desc(sql`max(${tlsCommerceJobs.createdAt})`))
+      .limit(1000);
 
-    // ── Open (unfulfilled) job exposure ──────────────────────────────
-    const [openJobsExposure] = await db
-      .select({
-        count: sql<number>`count(*)::int`,
-        totalAmount: sql<string>`coalesce(sum(${tlsCommerceJobs.amount}), '0')`,
-      })
-      .from(tlsCommerceJobs)
-      .where(
-        and(
-          eq(tlsCommerceJobs.talosId, id),
-          sql`${tlsCommerceJobs.status} in ('pending', 'processing')`
-        )
-      );
+    const filtered = rows
+      .map((row) => ({
+        agentId: id,
+        counterpartyId: row.counterpartyId,
+        asset: row.asset ?? "USDC",
+        category: row.category ?? "unknown",
+        reservedAmount: toNumber(row.reservedAmount),
+        settledAmount: toNumber(row.settledAmount),
+        reservedCount: row.reservedCount ?? 0,
+        settledCount: row.settledCount ?? 0,
+        windowDays,
+        lastObservedAt: normalizeDate(row.lastObservedAt),
+      }))
+      .filter((row) => {
+        const counterpartyFilter = searchParams.get("counterparty");
+        if (counterpartyFilter && row.counterpartyId !== counterpartyFilter) return false;
 
-    // ── Revenue exposure (dependency on single source) ───────────────
-    const revenueBySource = await db
-      .select({
-        source: tlsRevenues.source,
-        total: sql<string>`coalesce(sum(${tlsRevenues.amount}), '0')`,
-        count: sql<number>`count(*)::int`,
-      })
-      .from(tlsRevenues)
-      .where(
-        and(
-          eq(tlsRevenues.talosId, id),
-          gte(tlsRevenues.createdAt, thirtyDaysAgo)
-        )
-      )
-      .groupBy(tlsRevenues.source);
+        const assetFilter = searchParams.get("asset");
+        if (assetFilter && row.asset !== assetFilter) return false;
 
-    const totalRevenue30d = revenueBySource.reduce(
-      (acc, r) => acc + Number(r.total),
-      0
-    );
+        const categoryFilter = searchParams.get("category");
+        if (categoryFilter && row.category !== categoryFilter) return false;
 
-    // Concentration: largest single revenue source / total revenue
-    const maxSourceRevenue = revenueBySource.reduce(
-      (max, r) => Math.max(max, Number(r.total)),
-      0
-    );
-    const revenueConcentrationPct =
-      totalRevenue30d > 0
-        ? Math.round((maxSourceRevenue / totalRevenue30d) * 10000) / 100
-        : 0;
+        return true;
+      });
 
-    // ── Pending approval exposure (uncommitted liabilities) ──────────
-    const [pendingLiabilities] = await db
-      .select({
-        count: sql<number>`count(*)::int`,
-        totalAmount: sql<string>`coalesce(sum(${tlsApprovals.amount}), '0')`,
-      })
-      .from(tlsApprovals)
-      .where(
-        and(
-          eq(tlsApprovals.talosId, id),
-          eq(tlsApprovals.status, "pending"),
-          sql`${tlsApprovals.amount} is not null`
-        )
-      );
+    const cursorIndex = cursor
+      ? filtered.findIndex((row) => row.lastObservedAt === cursor)
+      : -1;
+    const startIndex = cursorIndex >= 0 ? cursorIndex + 1 : 0;
+    const page = filtered.slice(startIndex, startIndex + limit + 1);
+    const hasMore = page.length > limit;
+    const items = hasMore ? page.slice(0, limit) : page;
 
-    // ── Approved spend 90-day for trend context ───────────────────────
-    const [approvedSpend90d] = await db
-      .select({
-        total: sql<string>`coalesce(sum(${tlsApprovals.amount}), '0')`,
-      })
-      .from(tlsApprovals)
-      .where(
-        and(
-          eq(tlsApprovals.talosId, id),
-          eq(tlsApprovals.status, "approved"),
-          sql`${tlsApprovals.amount} is not null`,
-          gte(tlsApprovals.createdAt, ninetyDaysAgo)
-        )
-      );
-
-    const totalCounterpartyExposure = counterpartyRows.reduce(
-      (acc, r) => acc + Number(r.totalAmount),
-      0
-    );
-
-    // Risk tier for overall exposure
-    const exposureRatio =
-      totalRevenue30d > 0
-        ? (totalCounterpartyExposure / totalRevenue30d) * 100
-        : 0;
-    const riskTier =
-      exposureRatio > 150
-        ? "high"
-        : exposureRatio > 75
-        ? "medium"
-        : "low";
+    const freshest = items[0]?.lastObservedAt ?? filtered[0]?.lastObservedAt ?? null;
+    const freshness = freshest
+      ? {
+          timestamp: freshest,
+          stale: Date.now() - new Date(freshest).getTime() > 24 * 60 * 60 * 1000,
+        }
+      : null;
 
     return Response.json({
-      talosId: talos.id,
-      talosName: talos.name,
-      generatedAt: now.toISOString(),
-
-      counterpartyExposure: {
-        totalExposure30d: Math.round(totalCounterpartyExposure * 100) / 100,
-        counterpartyCount: counterpartyRows.length,
-        topCounterparties: counterpartyRows
-          .sort((a, b) => Number(b.totalAmount) - Number(a.totalAmount))
-          .slice(0, 5)
-          .map((r) => ({
-            counterpartyId: r.counterpartyId,
-            jobCount: r.jobCount,
-            totalAmount: Math.round(Number(r.totalAmount) * 100) / 100,
-            pendingJobs: r.pendingCount,
-            failedJobs: r.failedCount,
-          })),
+      agentId: id,
+      windowDays,
+      pagination: {
+        limit,
+        nextCursor: hasMore ? items[items.length - 1]?.lastObservedAt ?? null : null,
       },
-
-      openJobExposure: {
-        openJobs: openJobsExposure.count,
-        totalOpenAmount: Math.round(Number(openJobsExposure.totalAmount) * 100) / 100,
-      },
-
-      revenueExposure: {
-        totalRevenue30d: Math.round(totalRevenue30d * 100) / 100,
-        revenueConcentrationPct,
-        sourceCount: revenueBySource.length,
-        sources: revenueBySource.map((r) => ({
-          source: r.source,
-          total: Math.round(Number(r.total) * 100) / 100,
-          transactions: r.count,
-        })),
-      },
-
-      liabilityExposure: {
-        pendingApprovals: pendingLiabilities.count,
-        pendingAmount: Math.round(Number(pendingLiabilities.totalAmount) * 100) / 100,
-        approvedSpend90d: Math.round(Number(approvedSpend90d.total) * 100) / 100,
-      },
-
-      riskTier,
-      exposureRatioPct: Math.round(exposureRatio * 100) / 100,
-      riskMessage:
-        riskTier === "high"
-          ? "⚠ High exposure — counterparty spend significantly exceeds revenue"
-          : riskTier === "medium"
-          ? "⚠ Moderate exposure — monitor counterparty concentration"
-          : "✓ Exposure within acceptable range",
+      freshness,
+      exposures: items,
     });
-  } catch (err) {
-    console.error("[exposure GET]", err);
+  } catch {
     return Response.json({ error: "Internal server error" }, { status: 500 });
   }
 }
+
+export const GET = withRequestId(_GET);
